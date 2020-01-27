@@ -1,26 +1,30 @@
 mysql-json-bridge
 =================
-Talk to MySQL using HTTP POST and get result sets via JSON.
+This is a fork of the mysql-json-bridge as found at:
+http://github.com/rackerhacker/mysql-json-bridge. It has been changed such that
+it acts as a restful database between an Ember.js client and a MariaDB (nee
+MySQL database.)
 
-Key features
-------------
-
-* Use any scripting/programming language to talk to MySQL
-* Make a single endpoint for multiple environments and database servers
-* Use any authentication mechanism your web server supports for database access
-* Handle queries through HTTP load balancers
+It has been updated from the source to Python 3 and to support the default
+Ember.js RESTadapter.
 
 Installation & Startup
 ----------------------
 Install a few prerequisites:
 
-    pip install flask pyyaml
-    # requests is optional, but you need it to use the quick test file
-    pip install requests 
+   The Debian packages required to run this software are as follows:
+   python3
+   python3-flask
+   python3-pretty-yaml
+   python3-jsonpickle
+   python3-pymysql
+   python3-inflect
+   python3-dateutil
+   python3-flash-cors
 
 Get the source:
 
-    git clone http://github.com/rackerhacker/mysql-json-bridge
+    git clone http://github.com/BruceJL/mysql-json-bridge
     cd mysql-json-bridge
     python app.py
 
@@ -50,29 +54,36 @@ Make a conf.d directory with separate database configuration files:
 
 Usage
 -----
-Look inside the `examples/query_test.py` file for a quick example.  To issue a query to the bridge, simply make an HTTP POST to the appropriate URL.  Your URL should be something like this:
+To issue a query to the bridge, simply make an HTTP POST to the appropriate URL.
+Your URL should be something like this:
 
-    http://localhost:5000/query/<database>
+    http://localhost:5000/<database>/<table>
 
-You can also test with curl:
+Will pull all entries for that table.
 
-    curl http://localhost:5000/query/production-sales -X POST -d 'sql=SELECT version()'
-
-Example wsgi file for usage with a web server:
-
-    # mysql-json-bridge.wsgi
-    import sys
-    sys.path.insert(0, '/path/to/mysql-json-bridge/')
-    from app import app as application
+Example wsgi file for usage with a web server is supplied as wsgi.py. It seems
+to run will using gunicorn.
 
 *IMPORTANT* security considerations
 -----------------------------------
-**The base mysql-json-bridge server doesn't do any query filtering nor does it do any authentication.  You'd need to configure that yourself within your web server.**
+**The base mysql-json-bridge server doesn't do any query filtering nor does it
+do any authentication.  You'd need to configure that yourself within your web
+server.**
 
-Also, be very careful with the user you configure in your `environments.yml`.  If the user has write access to your database, people could issue UPDATE and DELETE statements through the bridge.
+Also, be very careful with the user you configure in your `environments.yml`.
+If the user has write access to your database, people could issue UPDATE and
+DELETE statements through the bridge.
 
-If you create read-only MySQL users for the bridge to use, **ensure that those users have read access *only* to the databases that you specify.**  Giving global read access to a user allows them to read your `mysql.user` table which contains hashed passwords.  *This could lead to a very bad experience.*
+If you create read-only MySQL users for the bridge to use, **ensure that those
+users have read access *only* to the databases that you specify.**  Giving
+global read access to a user allows them to read your `mysql.user` table which
+contains hashed passwords.  *This could lead to a very bad experience.*
 
 Got improvements?  Found a bug?
 -------------------------------
-Issue a pull request or open an issue in GitHub.  I'm still learning Python and I'm sure there are some better ways to do things than I'm currently doing them.  I appreciate and welcome all feedback you have!
+Issue a pull request or open an issue in GitHub.
+I appreciate and welcome all feedback you have!
+
+Tip of the hat
+--------------------
+Big tip of the hat to major for the material to make the fork.
