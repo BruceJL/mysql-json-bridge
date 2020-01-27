@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/python3
 #
 # Copyright 2012 Major Hayden
 #
@@ -23,15 +23,25 @@ import logging
 import os
 import sys
 import yaml
+import inflect
+import pymysql
+import threading
+import re
 
-from flask import Flask, Response, abort, request
-from functools import wraps
-from torndb import Connection
-from urlparse import urlparse, urlunparse
+from dateutil import parser
+from flask import Flask, Response, abort, request, current_app
+from functools import wraps, update_wrapper
+from urllib.parse import urlparse, urlunparse
+from flask_cors import CORS, cross_origin
 
 app = Flask(__name__)
+CORS(app)
+app.logger.setLevel(logging.INFO)
 app.debug = True
+dbs = {}
 
+inflection = inflect.engine()
+sql_condition = threading.Condition()
 
 # Helps us find non-python files installed by setuptools
 def data_file(fname):
@@ -81,6 +91,7 @@ def json_fixup(obj):
 
 
 def read_config():
+    app.logger.debug("entering read_config()")
     databases = {}
     cfiles = []
 
@@ -125,7 +136,8 @@ def read_config():
         connection_string = urlunparse(conn)
 
         tmp[identifier] = connection_string
-        databases = dict(databases.items() + tmp.items())
+        databases = dict(databases.items() | tmp.items())
+        app.logger.debug("Successfully read configuration files")
     return databases
 
 
@@ -142,10 +154,10 @@ def get_db_creds(database):
     try:
         o = urlparse(mysql_uri)
         creds = {
-            'host':         o.hostname,
-            'database':     o.path[1:],
-            'user':         o.username,
-            'password':     o.password,
+            'host':   o.hostname,
+            'db':     o.path[1:],
+            'user':   o.username,
+            'passwd': o.password,
         }
     except:
         creds = False
@@ -153,102 +165,200 @@ def get_db_creds(database):
     return creds
 
 
-# Handles the listing of available databases
-@app.route("/list", methods=['GET'])
-def return_database_list():
-    databases = read_config()
-    data = {'databases': databases.keys()}
-    return Response(json.dumps(data), mimetype='application/json')
+def setup_db_connection(database):
+    if database in dbs.keys():
+        db = dbs[database]
+        if db.open:
+           app.logger.debug("Using existing database connection to " + database)
+           return db
 
-
-# This is what receives our SQL queries
-@app.route("/query/<database>", methods=['POST', 'GET'])
-@jsonify
-def do_query(database=None):
-    # Pick up the database credentials
-    # app.logger.warning("%s requesting access to %s database" % (
-    #     request.remote_addr, database))
     creds = get_db_creds(database)
 
     # If we couldn't find corresponding credentials, throw a 404
     if not creds:
-        return {"ERROR": "Unable to find credentials matching %s." % database}
-        abort(404)
+        app.logger.error("Unable to find credentials for %s." % database)
+        raise Exception("ERROR Unable to find credentials matching %s." % database)
 
     # Prepare the database connection
     app.logger.debug("Connecting to %s database (%s)" % (
         database, request.remote_addr))
-    db = Connection(**creds)
+    db = pymysql.connect(**creds)
+    db.autocommit(True)
 
-    # See if we received a query
-    sql = request.form.get('sql')
-    if not sql:
-        sql = request.args.get('sql')
-        if not sql:
-            return {"ERROR": "SQL query missing from request."}
+    dbs[database] = db
+    #return the database object
+    return db
 
-    # If the query has a percent sign, we need to excape it
-    if '%' in sql:
-        sql = sql.replace('%', '%%')
 
+def execute_sql(cursor, database, sql, vars):
     # Attempt to run the query
+    app.logger.info("%s attempting to run \"%s\" against %s database with tuple %s" % (
+        request.remote_addr, sql, database, vars))
     try:
-        app.logger.info("%s attempting to run \" %s \" against %s database" % (
-            request.remote_addr, sql, database))
-        results = db.query(sql)
-        app.logger.info(results)
-    except Exception, e:
-        return {"ERROR": ": ".join(str(i) for i in e.args)}
+        sql_condition.acquire()
+        cursor.execute(sql, vars)
+        data = cursor.fetchall()
+        sql_condition.release()
+        app.logger.info("returning " + str(len(data)) + " results")
+        app.logger.debug("results: " + str(data))
+        return data
 
-    # Disconnect from the DB
-    db.close()
+    except pymysql.err.MySQLError as e:
+        app.logger.error("ERROR" +  str(e.args) + " When running " + sql)
+        #app.logger.error("ERROR" + " ".join(str(i) for i in e.args + "When running " + sql))
+        abort(500)
+    except Exception as e:
+        app.logger.error("query failed: " + str(e))
 
-    return {'result': results}
+
+def make_name_value_list_string(items):
+    updates = []
+    vars = ()
+    for k, v in items:
+        if v is not None:
+            if type(v) is str:
+                if re.search('^\d\d\d\d-\d\d-\d\dT\d\d:\d\d:\d\d\.\d\d\dZ$', v):
+                    if "1970-01-01T00:00:00.000Z" == v:
+                        v = datetime.datetime.now().isoformat()
+                    else:
+                        v = parser.parse(v)
+                        v = v.strftime("%Y-%m-%d %H:%M:%S")
+
+            updates.append("`" + str(k) + "`= %s")
+            vars = vars + (v,)
+
+    # make the string
+    string = ','.join(str(x) for x in updates)
+    return (string, vars)
 
 
-@app.route("/update/<database>", methods=['POST', 'GET'])
+# This handles ember style queries
+@app.route("/<database>/<table>", methods=['GET'])
 @jsonify
-def do_update(database=None):
-    # Pick up the database credentials
-    # app.logger.warning("%s requesting access to %s database" % (
-    #     request.remote_addr, database))
-    creds = get_db_creds(database)
+def do_ember_table(database=None, table=None):
+    db = None
+    try:
+        db = setup_db_connection(database)
 
-    # If we couldn't find corresponding credentials, throw a 404
-    if not creds:
-        return {"ERROR": "Unable to find credentials matching %s." % database}
+        table_singular = inflection.singular_noun(table)
+        if table_singular != False:
+
+
+            cursor = db.cursor(pymysql.cursors.DictCursor)
+
+            sql = "SELECT * from `" + table_singular + "`;"
+            results = execute_sql(cursor, database, sql, ())
+            return {table : results}
+        else:
+            abort(404)
+
+    except pymysql.err.MySQLError as e:
+        app.logger.error("Failed to setup database connection: " + str(e) )
         abort(404)
 
-    # Prepare the database connection
-    app.logger.debug("Connecting to %s database (%s)" % (
-        database, request.remote_addr))
-    db = Connection(**creds)
 
-    # See if we received a query
-    sql = request.form.get('sql')
-    if not sql:
-        sql = request.args.get('sql')
-        if not sql:
-            return {"ERROR": "SQL query missing from request."}
+# This method is used to create new entries
+@app.route("/<database>/<table>", methods=['POST'])
+def do_json_table_post(database=None, table=None):
+    db        = None
+    data      = None
+    json_data = None
 
-    # If the query has a percent sign, we need to excape it
-    if '%' in sql:
-        sql = sql.replace('%', '%%')
+    app.logger.info("Got POST to " + database + " table " + table + " of " + str(request.json))
+    db = setup_db_connection(database)
 
-    # Attempt to run the query
+    table_singular = inflection.singular_noun(table)
+    cursor = db.cursor(pymysql.cursors.DictCursor)
+
+    (s, vars) = make_name_value_list_string(request.json[table_singular].items())
+
+    sql = "INSERT INTO `" + table_singular + \
+          "` SET " + s + ";"
     try:
-        app.logger.info("%s attempting to run \" %s \" against %s database" % (
-            request.remote_addr, sql, database))
-        results = db.update(sql)
-        app.logger.info(results)
-    except Exception, e:
-        return {"ERROR": ": ".join(str(i) for i in e.args)}
+        results = execute_sql(cursor, database, sql, vars)
 
-    # Disconnect from the DB
-    db.close()
+        sql = "SELECT LAST_INSERT_ID();"
+        results = execute_sql(cursor, database, sql, ())
 
-    return {'result': results}
+        id = str(results[0]['LAST_INSERT_ID()'])
 
+        sql = "SELECT * FROM `" + table_singular + "` WHERE id = %s;"
+        results = execute_sql(cursor, database, sql, (id,))
+        result = results[0]
+        data = {table: result}
+        json_data = json.dumps(data, default=json_fixup)
+        app.logger.info("json data: " + str(json_data))
+
+    except pymysql.err.MySQLError as e:
+        app.logger.error(str(e))
+        raise e
+
+    finally:
+        if json_data is not None:
+            return Response(json_data, status=201, mimetype='application/json')
+        else:
+            abort(500)
+
+@app.route("/<database>/<table>/<id>", methods=['GET'])
+@jsonify
+def do_json_get_table_entry(database=None, table=None, id=None):
+    db   = None
+    data = None
+    try:
+        db = setup_db_connection(database)
+
+        table_singular = inflection.singular_noun(table)
+        cursor = db.cursor(pymysql.cursors.DictCursor)
+
+        sql = "SELECT * from `" + table_singular + \
+              "` WHERE `id`=%s;"
+
+        results = execute_sql(cursor, database, sql, (id,))
+        result = results[0]
+        data = {table : result}
+
+        if request.args.get('include') is not None:
+            include_singular = request.args.get('include')
+            include = inflection.plural(include_singular)
+
+            sql = "SELECT * from `" + include_singular + \
+                "` WHERE `" + table_singular + "`= %s;"
+            include_results = execute_sql(cursor, database, sql, (id,))
+
+            include_indexs = []
+            for x in include_results:
+                include_indexs.append(x['id'])
+
+            app.logger.debug("include_indexs: " + str(include_indexs))
+
+            result.update({include : include_indexs})
+            data = {table : [result], include : include_results}
+
+    except pymysql.err.MySQLError as e:
+        app.logger.error("MySQLError: " + str(e))
+        abort(404)
+    finally:
+        return data
+
+@app.route("/<database>/<table>/<id>", methods=['PUT'])
+@jsonify
+def do_json_put_table_entry(database=None, table=None, id=None):
+    app.logger.info("Got PUT to " + database + ", table " + table + ", id " + id + " of " + str(request.json))
+
+    db = setup_db_connection(database)
+
+    table_singular = inflection.singular_noun(table)
+    cursor = db.cursor(pymysql.cursors.DictCursor)
+
+    app.logger.debug("json: " + str(request.json[table_singular].items()))
+    (s, vars) = make_name_value_list_string(request.json[table_singular].items())
+
+    sql = "UPDATE `" + table_singular + \
+          "` SET " + \
+          s + \
+          " WHERE `id`= %s;"
+    results = execute_sql(cursor, database, sql, vars + (id,))
+    return Response("", status=200)
 
 if __name__ == "__main__":
-    app.run(host='0.0.0.0')
+    app.run(host='0.0.0.0', threaded=True)
